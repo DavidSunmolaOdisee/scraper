@@ -4,21 +4,31 @@ import puppeteer from "puppeteer";
 
 const app = express();
 app.use(cors());
+
 const AUTH = process.env.SCRAPER_TOKEN || "dev-secret";
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const UA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 let browser;
 async function getBrowser() {
   if (!browser) {
-const browser = await puppeteer.launch({
-  headless: "new",
-  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // <- belangrijk
-  args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
-});
-
+    browser = await puppeteer.launch({
+      headless: "new",
+      // Gebruik Chromium uit het base image, of fallback naar bundled path
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--no-zygote",
+        "--single-process"
+      ]
+    });
   }
   return browser;
 }
+
 
 function collectMedia() {
   const media = []; const seen = new Set();
