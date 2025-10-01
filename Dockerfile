@@ -1,14 +1,16 @@
-FROM node:20-bullseye
+# heeft Chromium + alle vereiste libs al ingebakken
+FROM ghcr.io/puppeteer/puppeteer:22.6.0
+
 WORKDIR /app
 
-# alleen package files kopiëren voor betere caching
+# alleen package files voor cache
 COPY package*.json ./
-
-# GEEN npm ci (geen lockfile); gebruik install
 RUN npm install --omit=dev
 
-# rest van de code
 COPY server.js ./
+
+# puppeteer-image zet deze env var automatisch:
+# PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 EXPOSE 8080
 CMD ["node","server.js"]
