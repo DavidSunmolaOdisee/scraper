@@ -10,10 +10,12 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 let browser;
 async function getBrowser() {
   if (!browser) {
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
-    });
+const browser = await puppeteer.launch({
+  headless: "new",
+  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH, // <- belangrijk
+  args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
+});
+
   }
   return browser;
 }
