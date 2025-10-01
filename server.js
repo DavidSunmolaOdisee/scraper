@@ -46,20 +46,9 @@ async function getBrowser() {
 function allowUrl(u) {
   try { u = new URL(u).toString(); } catch { return false; }
   if (!/^https?:\/\//i.test(u)) return false;
-  if (!/(facebook\.(com|net)|fbcdn|scontent|cdninstagram)/i.test(u)) return false;
+  if (!/(facebook\.(com|net)|fbcdn|scontent|cdninstagram|video-.*\.fbcdn\.net)/i.test(u)) return false;
   if (/rsrc\.php|hsts-pixel|sprite|emoji|\/p50x50\//i.test(u)) return false;
   return true;
-}
-
-function candidateTargets(id) {
-  return [
-    `https://www.facebook.com/ads/library/?id=${id}`,
-    `https://www.facebook.com/ads/library/ad/?id=${id}`,
-    `https://m.facebook.com/ads/library/?id=${id}`,
-    `https://mbasic.facebook.com/ads/library/?id=${id}`,
-    // legacy fallback:
-    `https://www.facebook.com/ads/archive/render_ad/?id=${id}`,
-  ];
 }
 
 async function tryAcceptCookies(page) {
@@ -87,7 +76,7 @@ function collectMediaInThisDom() {
   const media = []; const seen = new Set();
   const allow = (u) =>
     /^https?:\/\//i.test(u) &&
-    /(facebook\.(com|net)|fbcdn|scontent|cdninstagram)/i.test(u) &&
+    /(facebook\.(com|net)|fbcdn|scontent|cdninstagram|video-.*\.fbcdn\.net)/i.test(u) &&
     !/rsrc\.php|hsts-pixel|sprite|emoji|\/p50x50\//i.test(u);
   const push = (kind, url) => {
     if (!url) return;
@@ -177,35 +166,55 @@ async function gotoWithRetry(page, url) {
   }
 }
 
-// ------------- Filter & Ranking (belangrijk) -------------
-function filterAndRankMedia(mediaIn) {
+// ------------- Filter, Ranking & Classify -------------
+function filterRankAndClassify(mediaIn) {
   // dedup
   const seen = new Set();
-  let media = [];
+  const dedup = [];
   for (const m of mediaIn) {
     if (!m?.url) continue;
     const key = m.kind + "|" + m.url;
-    if (!seen.has(key)) { seen.add(key); media.push(m); }
+    if (!seen.has(key)) { seen.add(key); dedup.push(m); }
   }
 
-  // rommel/kleine plaatjes eruit
-  const BAD = /(empty-state|overfiltering|politics\/archive|sprite|emoji|p50x50|s60x60|s96x96|s148x148|\/v\/t39\.30808-1\/)/i;
-  media = media.filter(m => !BAD.test(m.url));
+  // splitsen
+  const BAD_IMG = /(empty-state|overfiltering|politics\/archive|sprite|emoji|p50x50|s60x60|s96x96|s148x148|\/v\/t39\.30808-1\/)/i;
+  const images = dedup.filter(m => m.kind === "image" && !BAD_IMG.test(m.url));
+  const videos = dedup.filter(m => m.kind === "video");
+  const has_video = videos.length > 0;
 
-  // score voor sortering
+  // detecteer carrousel (heuristiek: meerdere “grote” scontent-afbeeldingen)
   const SIZE_HINT = /(s1200x1200|s2048x2048|s1920x1080|s1280x720|s1080x1080|s960x960|s720x720|s600x600)/i;
-  function score(m) {
+  const bigImages = images.filter(i => SIZE_HINT.test(i.url) || /safe_image\.php/i.test(i.url));
+  const carousel_count = bigImages.length >= 3 ? bigImages.length : (images.length >= 3 ? images.length : 0);
+
+  // sorteer afbeeldingen (video’s NIET meenemen voor thumbnail)
+  function imgScore(u) {
     let s = 0;
-    if (m.kind === "video") s += 100;
-    if (SIZE_HINT.test(m.url)) s += 40;
-    if (/safe_image\.php/i.test(m.url)) s += 10;     // vaak de echte creative
-    if (/profile|avatar/i.test(m.url)) s -= 30;      // avatars omlaag
+    if (SIZE_HINT.test(u)) s += 40;
+    if (/safe_image\.php/i.test(u)) s += 10;
+    if (/profile|avatar/i.test(u)) s -= 30;
     return s;
   }
+  images.sort((a,b) => imgScore(b.url) - imgScore(a.url));
 
-  media.sort((a,b) => score(b) - score(a));
-  const best = media[0] || null;
-  return { media, thumbnail_url: best ? best.url : null };
+  // kies thumbnail: altijd een afbeelding, bij carrousel is dit effectief de "eerste" (hoogst gescored)
+  const thumbnail_url = images[0]?.url || null;
+
+  // klasse
+  let ad_kind = "IMAGE";
+  if (carousel_count >= 3) ad_kind = "CAROUSEL";
+  else if (has_video && images.length <= 1) ad_kind = "VIDEO"; // we vermelden video, maar geven geen video-thumb terug
+
+  // let op: we geven alleen afbeeldingen in 'media' terug,
+  // zodat front-end nooit per ongeluk een video als thumb kiest.
+  return {
+    media: images,
+    thumbnail_url,
+    has_video,
+    ad_kind,
+    carousel_count
+  };
 }
 
 // ---------- Routes ----------
@@ -222,7 +231,7 @@ app.get("/preview", async (req, res) => {
 
   await acquireSlot();
   const sniff = []; // netwerk fallback (images/videos)
-  let usedTarget = null;
+  const target = `https://www.facebook.com/ads/library/?id=${id}`;
 
   try {
     const br = await getBrowser();
@@ -257,54 +266,46 @@ app.get("/preview", async (req, res) => {
       return r.abort();
     });
 
-    let media = [], thumbnail_url = null;
+    // ---- navigatie + scraping ----
+    await gotoWithRetry(page, target);
+    await tryAcceptCookies(page);
 
-    // Probeer meerdere targets; stop zodra we iets bruikbaars hebben
-    for (const t of candidateTargets(id)) {
-      try {
-        await gotoWithRetry(page, t);
-        await tryAcceptCookies(page);
+    try { await page.waitForSelector('img, meta[property="og:image"]', { timeout: 6000 }); } catch {}
+    await autoScroll(page);
+    await sleep(800);
 
-        try { await page.waitForSelector('img, meta[property="og:image"]', { timeout: 6000 }); } catch {}
-        await autoScroll(page);
-        await sleep(800);
+    // DOM + iframes
+    let media = await collectAllFrames(page);
 
-        // DOM + iframes
-        media = await collectAllFrames(page);
-
-        // netwerk-fallback toevoegen als DOM niets gaf
-        if (media.length === 0 && sniff.length > 0) {
-          const uniq = new Map();
-          for (const m of sniff) if (allowUrl(m.url) && !uniq.has(m.url)) uniq.set(m.url, m);
-          media = Array.from(uniq.values());
-        }
-
-        // filter & ranking
-        ({ media, thumbnail_url } = filterAndRankMedia(media));
-
-        // “niet beschikbaar” → probeer volgende
-        if (media.length === 0) {
-          const bodyText = (await page.evaluate(() => document.body.innerText).catch(() => "")).toLowerCase();
-          if (/niet beschikbaar|not available|no está disponible|nicht verfügbar/.test(bodyText)) continue;
-        }
-
-        if (media.length > 0) { usedTarget = t; break; }
-      } catch { /* volgende target */ }
+    // netwerk-fallback toevoegen als DOM niets gaf
+    if (media.length === 0 && sniff.length > 0) {
+      const uniq = new Map();
+      for (const m of sniff) if (allowUrl(m.url) && !uniq.has(m.url)) uniq.set(m.url, m);
+      media = Array.from(uniq.values());
     }
 
-    // laatste redmiddel: reload van laatste kandidaat
-    if (!usedTarget) {
-      const last = candidateTargets(id).at(-1);
-      await gotoWithRetry(page, last);
+    // filter & classificatie (géén video in media, wel has_video/ad_kind)
+    let { media: imagesOnly, thumbnail_url, has_video, ad_kind, carousel_count } = filterRankAndClassify(media);
+
+    // laatste redmiddel: zachte reload
+    if (imagesOnly.length === 0) {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
       await sleep(700);
       media = await collectAllFrames(page);
-      ({ media, thumbnail_url } = filterAndRankMedia(media));
-      usedTarget = last;
+      ({ media: imagesOnly, thumbnail_url, has_video, ad_kind, carousel_count } = filterRankAndClassify(media));
     }
 
     await page.close();
     res.set("Cache-Control", "public, max-age=600");
-    return res.json({ ok: true, media, thumbnail_url, target: usedTarget });
+    return res.json({
+      ok: true,
+      media: imagesOnly,         // alleen afbeeldingen
+      thumbnail_url,             // gekozen thumbnail (image)
+      has_video,                 // true/false: er was ook video aanwezig
+      ad_kind,                   // "IMAGE" | "CAROUSEL" | "VIDEO"
+      carousel_count,            // >0 bij carrousel
+      target                     // welke URL is gescrapet
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, code: "SCRAPE_ERROR", message: String(e?.message || e) });
   } finally {
