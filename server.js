@@ -126,7 +126,7 @@ function collectMediaInThisDom() {
   return media;
 }
 
-// bundel alle frames + kies thumbnail
+// bundel alle frames
 async function collectAllFrames(page) {
   const frames = page.frames();
   const out = []; const seen = new Set();
@@ -140,10 +140,7 @@ async function collectAllFrames(page) {
       }
     } catch { /* frame kan al weg zijn */ }
   }
-  const thumb =
-    out.find(m => m.kind === "image" && /(fbcdn|scontent|cdninstagram)/i.test(m.url)) ||
-    out.find(m => m.kind === "image") || null;
-  return { media: out, thumbnail_url: thumb ? thumb.url : null };
+  return out;
 }
 
 // auto-scroll voor lazy loads
@@ -180,6 +177,37 @@ async function gotoWithRetry(page, url) {
   }
 }
 
+// ------------- Filter & Ranking (belangrijk) -------------
+function filterAndRankMedia(mediaIn) {
+  // dedup
+  const seen = new Set();
+  let media = [];
+  for (const m of mediaIn) {
+    if (!m?.url) continue;
+    const key = m.kind + "|" + m.url;
+    if (!seen.has(key)) { seen.add(key); media.push(m); }
+  }
+
+  // rommel/kleine plaatjes eruit
+  const BAD = /(empty-state|overfiltering|politics\/archive|sprite|emoji|p50x50|s60x60|s96x96|s148x148|\/v\/t39\.30808-1\/)/i;
+  media = media.filter(m => !BAD.test(m.url));
+
+  // score voor sortering
+  const SIZE_HINT = /(s1200x1200|s2048x2048|s1920x1080|s1280x720|s1080x1080|s960x960|s720x720|s600x600)/i;
+  function score(m) {
+    let s = 0;
+    if (m.kind === "video") s += 100;
+    if (SIZE_HINT.test(m.url)) s += 40;
+    if (/safe_image\.php/i.test(m.url)) s += 10;     // vaak de echte creative
+    if (/profile|avatar/i.test(m.url)) s -= 30;      // avatars omlaag
+    return s;
+  }
+
+  media.sort((a,b) => score(b) - score(a));
+  const best = media[0] || null;
+  return { media, thumbnail_url: best ? best.url : null };
+}
+
 // ---------- Routes ----------
 app.get("/", (_req, res) => res.send("OK — use /preview?id=... with X-Auth header"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -193,7 +221,7 @@ app.get("/preview", async (req, res) => {
     return res.status(400).json({ ok: false, code: "BAD_ID", message: "id must be numeric" });
 
   await acquireSlot();
-  const sniff = []; // netwerk fallback
+  const sniff = []; // netwerk fallback (images/videos)
   let usedTarget = null;
 
   try {
@@ -207,7 +235,7 @@ app.get("/preview", async (req, res) => {
     page.setDefaultNavigationTimeout(45000);
     page.setDefaultTimeout(15000);
 
-    // Sniff network (images/videos) als fallback
+    // Sniff network
     page.on("response", async (r) => {
       const url = r.url();
       if (!allowUrl(url)) return;
@@ -241,16 +269,18 @@ app.get("/preview", async (req, res) => {
         await autoScroll(page);
         await sleep(800);
 
-        ({ media, thumbnail_url } = await collectAllFrames(page));
+        // DOM + iframes
+        media = await collectAllFrames(page);
 
+        // netwerk-fallback toevoegen als DOM niets gaf
         if (media.length === 0 && sniff.length > 0) {
           const uniq = new Map();
           for (const m of sniff) if (allowUrl(m.url) && !uniq.has(m.url)) uniq.set(m.url, m);
-          const arr = Array.from(uniq.values());
-          const thumb = arr.find(m => m.kind === "image" && /(fbcdn|scontent|cdninstagram)/i.test(m.url))
-                     || arr.find(m => m.kind === "image");
-          if (arr.length) { media = arr; thumbnail_url = thumb ? thumb.url : null; }
+          media = Array.from(uniq.values());
         }
+
+        // filter & ranking
+        ({ media, thumbnail_url } = filterAndRankMedia(media));
 
         // “niet beschikbaar” → probeer volgende
         if (media.length === 0) {
@@ -267,7 +297,8 @@ app.get("/preview", async (req, res) => {
       const last = candidateTargets(id).at(-1);
       await gotoWithRetry(page, last);
       await sleep(700);
-      ({ media, thumbnail_url } = await collectAllFrames(page));
+      media = await collectAllFrames(page);
+      ({ media, thumbnail_url } = filterAndRankMedia(media));
       usedTarget = last;
     }
 
